@@ -892,6 +892,86 @@ class Ticket:
         return output
 
 
+class APP:
+    """Represents an APP file.
+       Can be encrypted or decrypted
+
+    Args:
+        file (Union[str, bytes]): Path to an APP or a APP bytes-object
+        tmdcontent (TMD.TMDContent): TMD content with app info
+        isencrypted (bool): Is the content encrypted? (Default: True)
+        ticket (Ticket): Valid Ticket class (needed for decrypting)
+    """
+
+    def __init__(self, file, tmdcontent, isencrypted=True, ticket=None):
+        if isinstance(file, str):
+            try:
+                file = open(file, 'rb').read()
+            except FileNotFoundError:
+                raise FileNotFoundError('File not found')
+
+        self.valid = None
+        if isencrypted:
+            self.encrypted = file
+            self.decrypted = None
+        else:
+            self.encrypted = None
+            self.decrypted = file
+            self.verify()
+
+        self.tmdcontent = tmdcontent
+        self.ticket = ticket
+
+    def decrypt(self):
+        """Decrypts and verifies APP file."""
+        if not self.ticket:
+            raise Exception("No ticket, can't be decrypted.")
+
+        if not self.decrypted:
+            valid, decdata = utils.Crypto.check_content_hash(self.tmdcontent, self.ticket, self.encrypted,
+                                                             return_decdata=True)
+            if not valid:
+                self.valid = False
+                print("WARNING: SHA1 Sum mismatch for {0} APP".format(self.tmdcontent.get_cid()))
+            else:
+                self.valid = True
+            self.decrypted = decdata
+
+    def verify(self):
+        """Verifies SHA1-sum."""
+        if not self.decrypted:
+            self.decrypt()
+
+        sha1hash = utils.Crypto.create_sha1hash(self.decrypted)
+        if sha1hash != self.tmdcontent.sha1:
+            self.valid = False
+            print("WARNING: SHA1 Sum mismatch for {0} APP".format(self.tmdcontent.get_cid()))
+        else:
+            self.valid = True
+
+    def encrypt(self):
+        """Encrypts APP file."""
+        if not self.ticket:
+            raise Exception("No ticket, can't be encrypted.")
+
+        if not self.encrypted:
+            self.encrypted = utils.Crypto.encrypt_data(self.ticket.decrypted_titlekey, self.tmdcontent.get_iv(),
+                                                       self.decrypted)
+
+    def __repr__(self):
+        return "APP {0}".format(self.tmdcontent.get_cid())
+
+    def __str__(self):
+        output = "APP:\n"
+        output += "  CID: {0}\n".format(self.tmdcontent.get_cid())
+        output += "  Encrypted: {0}\n".format("Yes" if self.encrypted else "No")
+        output += "  Decrypted: {0}\n".format("Yes" if self.decrypted else "No")
+        output += "  Ticket {0}available\n\n".format("un" if not self.ticket else "")
+        output += str(self.tmdcontent)
+
+        return output
+
+
 class WAD:
     """Represents a WAD file.
        Reference: https://wiibrew.org/wiki/WAD_files
@@ -953,7 +1033,7 @@ class WAD:
         for content in self.tmd.contents:
             content_size = content.size
             content_size += utils.align_pointer(content_size, 16)
-            self.contents.append(file[pos:pos + content_size])
+            self.contents.append(APP(file[pos:pos + content_size], content, isencrypted=True, ticket=self.ticket))
             pos += content_size
             pos += utils.align_pointer(pos)
 
@@ -965,14 +1045,16 @@ class WAD:
         else:
             self.footer = None
 
+    def get_content_by_cid(self, cid):
+        """Returns Content by CID."""
+        return self.contents[self.tmd.get_cr_index_by_cid(cid)]
+
     def unpack_file(self, cid, output=None, decrypt=False):
         """"Extracts file from WAD to output directory. Replaces {titleid} and {titleversion} if in folder name.
             Extracts to "extracted_wads/TITLEID/TITLEVER" if no output is given. Pass decrypt=True to decrypt.
         """
         cid = cid.lower()
-        num = self.tmd.get_cr_index_by_cid(cid)
-        tmdcontent = self.tmd.contents[num]
-        content = self.contents[num]
+        content = self.get_content_by_cid(cid)
 
         if output:
             output = output.format(titleid=self.tmd.get_titleid(), titleversion=self.tmd.hdr.titleversion)
@@ -981,16 +1063,13 @@ class WAD:
         if not os.path.isdir(output):
             os.makedirs(output)
 
-        filename = self.tmd.contents[num].get_cid()
+        filename = content.tmdcontent.get_cid()
         with open(os.path.join(output, filename), "wb") as content_file:
-            if decrypt:  # Decrypted Contents
-                valid, decdata = utils.Crypto.check_content_hash(tmdcontent, self.ticket, content,
-                                                                 return_decdata=True)
-                if not valid:
-                    print("WARNING: SHA1 Sum mismatch")
+            if decrypt:
+                content.decrypt()
                 with open(os.path.join(output, filename + ".app"), "wb") as decrypted_content_file:
-                    decrypted_content_file.write(decdata)
-            content_file.write(content)
+                    decrypted_content_file.write(content.decrypted)
+            content_file.write(content.encrypted)
 
     extract_file = unpack_file
 
@@ -1009,17 +1088,14 @@ class WAD:
         self.ticket.dump(os.path.join(output, "cetk"))
 
         # Encrypted Contents
-        for num, content in enumerate(self.contents):
-            filename = self.tmd.contents[num].get_cid()
+        for content in self.contents:
+            filename = content.tmdcontent.get_cid()
             with open(os.path.join(output, filename), "wb") as content_file:
                 if decrypt:  # Decrypted Contents
-                    valid, decdata = utils.Crypto.check_content_hash(self.tmd.contents[num], self.ticket, content,
-                                                                     return_decdata=True)
-                    if not valid:
-                        print("WARNING: SHA1 Sum mismatch for file {0}".format(filename + ".app"))
+                    content.decrypt()
                     with open(os.path.join(output, filename + ".app"), "wb") as decrypted_content_file:
-                        decrypted_content_file.write(decdata)
-                content_file.write(content)
+                        decrypted_content_file.write(content.decrypted)
+                content_file.write(content.encrypted)
 
         # Footer
         if self.footer:
@@ -1112,10 +1188,17 @@ class WADMaker:
         self.hdr.footersize = len(self.footer)
 
         # Contents
+        # TODO: Support already decrypted contents
         for content in self.tmd.contents:
-            self.contents.append(open(os.path.join(self.directory, content.get_cid()), 'rb'))
+            self.contents.append(APP(os.path.join(self.directory, content.get_cid()), content, isencrypted=True,
+                                     ticket=self.ticket))
+
+    def get_content_by_cid(self, cid):
+        """Returns Content by CID."""
+        return self.contents[self.tmd.get_cr_index_by_cid(cid)]
 
     def encrypt_file(self, cid):
+        # TODO
         """Encrypts one app file and updates the TMD."""
         cid = cid.lower()
         encfile = os.path.join(self.directory, cid)
@@ -1146,16 +1229,14 @@ class WADMaker:
 
     def decrypt(self):
         """Decrypts app files"""
-        for num, content in enumerate(self.contents):
-            tmdcontent = self.tmd.contents[num]
-            valid, decdata = utils.Crypto.check_content_hash(tmdcontent, self.ticket, content.read(),
-                                                             return_decdata=True)
-            with open(os.path.join(self.directory, tmdcontent.get_cid() + ".app"), "wb") as decrypted_content_file:
-                if not valid:
-                    print("WARNING: SHA1 Sum mismatch for file {0}".format(tmdcontent.get_cid() + ".app"))
-                decrypted_content_file.write(decdata)
+        for content in self.contents:
+            filename = content.tmdcontent.get_cid() + ".app"
+            with open(os.path.join(self.directory, filename), "wb") as content_file:
+                    content.decrypt()
+                    content_file.write(content.decrypted)
 
     def decrypt_file(self, cid):
+        # TODO
         """Decrypts one app file. Returns True if the SHA1 Sum matches."""
         cid = cid.lower()
         encfile = os.path.join(self.directory, cid)
@@ -1240,10 +1321,6 @@ class WADMaker:
             if self.footer:
                 wad_file.write(self.footer)
                 wad_file.write(utils.align(self.hdr.footersize))
-
-    def __del__(self):
-        for content in self.contents:
-            content.close()
 
     def __repr__(self):
         return "WAD Maker for Title {titleid} v{titlever}".format(
